@@ -11,7 +11,7 @@ Some small changes:
 """
 # mypy: ignore-errors
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -28,6 +28,10 @@ class LLaMAConfig(llama_adapter.LLaMAConfig):
     adapter_start_layer: int = 2
     train_wte: bool = False
     train_lm_head: bool = False
+    # The token ids of the learned pretext tokens which are to be gated with a
+    # learned gating factor are the last `pretext_adapter_length` ids of the
+    # model's vocab_size. Leave this as 0 if there are no learned pretext tokens.
+    pretext_adapter_length:int = 0
 
 
 def with_s_b(x, module, scale, bias):
@@ -75,7 +79,7 @@ class CausalSelfAttention(nn.Module):
             # adapter higher level embedding layer
             self.adapter_wte = nn.Embedding(config.adapter_prompt_length, config.n_embd)
             # gate for adaption
-            self.gating_factor = torch.nn.Parameter(torch.zeros(1))
+            self.gating_factor = nn.Parameter(torch.zeros(1))
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -132,6 +136,8 @@ class CausalSelfAttention(nn.Module):
             ay = F.scaled_dot_product_attention(q, ak, av, attn_mask=amask, dropout_p=0.0, is_causal=False)
             y = y + self.gating_factor * ay
 
+
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
@@ -174,7 +180,8 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
     """The implementation is identical to `lit_llama.model.Block` with the exception that
-    we replace the attention layer where adaption is implemented."""
+    we replace the attention layer where adaption is implemented,
+    """
 
     def __init__(self, config: LLaMAConfig, block_idx: int) -> None:
         super().__init__()

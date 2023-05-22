@@ -16,7 +16,7 @@ wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
 from generate import generate
-from lit_llama.adapter import LLaMA, LLaMAConfig, mark_only_adapter_as_trainable, adapter_state_from_state_dict
+from lit_llama.adapter_v2 import LLaMA, LLaMAConfig, mark_only_adapter_as_trainable, adapter_state_from_state_dict
 from lit_llama.tokenizer import Tokenizer
 from scripts.prepare_alpaca import generate_prompt
 from lightning.fabric.strategies import DeepSpeedStrategy
@@ -89,7 +89,7 @@ def main(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     model, optimizer = fabric.setup(model, optimizer)
-    train(fabric, model, optimizer, train_data, val_data, out_dir)
+    train(fabric, model, optimizer, train_data, val_data, out_dir, tokenizer_path)
 
     # Save the final checkpoint at the end of training
     save_model_checkpoint(fabric, model, os.path.join(out_dir, "lit-llama-adapter-finetuned.pth"))
@@ -102,6 +102,7 @@ def train(
     train_data: np.ndarray,
     val_data: np.ndarray,
     out_dir: str,
+    tokenizer_path: str,
 ) -> None:
     """The training loop.
 
@@ -131,7 +132,7 @@ def train(
             step_count += 1
                 
             if step_count % eval_interval == 0:
-                val_loss = validate(fabric, model, val_data)
+                val_loss = validate(fabric, model, val_data, tokenizer_path)
                 fabric.print(f"step {iter_num}: val loss {val_loss:.4f}")
                 fabric.barrier()
 
@@ -145,8 +146,8 @@ def train(
             fabric.print(f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms")
 
 
-def generate_response(model, instruction, input=""):
-    tokenizer = Tokenizer("checkpoints/lit-llama/tokenizer.model")
+def generate_response(model, instruction, tokenizer_path, input=""):
+    tokenizer = Tokenizer()
     sample = {"instruction": instruction, "input": input}
     prompt = generate_prompt(sample)
     encoded = tokenizer.encode(prompt, bos=True, eos=False, device=model.device)
@@ -163,7 +164,7 @@ def generate_response(model, instruction, input=""):
 
 
 @torch.no_grad()
-def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray) -> torch.Tensor:
+def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray, tokenizer_path:str) -> torch.Tensor:
     fabric.print("Validating ...")
     model.eval()
     losses = torch.zeros(eval_iters)
@@ -176,7 +177,7 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray) -> 
 
     # produce an example:
     instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
-    output = generate_response(model, instruction)
+    output = generate_response(model, instruction, tokenizer_path)
     fabric.print(instruction)
     fabric.print(output)
 
