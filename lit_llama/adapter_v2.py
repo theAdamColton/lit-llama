@@ -2,6 +2,12 @@
 
 LLaMA-Adapter V2: Parameter-Efficient Visual Instruction Model
 https://arxiv.org/abs/2304.15010
+
+Some small changes:
+    Allows the option to finetune wte embeddings.
+
+    Allows the option to finetune the lm_head. This should probably be used in
+    conjunction with finetuning embeddings.
 """
 # mypy: ignore-errors
 from dataclasses import dataclass
@@ -18,6 +24,8 @@ class LLaMAConfig(llama_adapter.LLaMAConfig):
     add_bias_and_scale: bool = True
     adapter_prompt_length: int = 10
     adapter_start_layer: int = 2
+    train_wte: bool = False
+    train_lm_head: bool = False
 
 
 def with_s_b(x, module, scale, bias):
