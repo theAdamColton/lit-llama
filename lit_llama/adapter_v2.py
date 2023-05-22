@@ -11,6 +11,7 @@ Some small changes:
 """
 # mypy: ignore-errors
 from dataclasses import dataclass
+from typing import List
 
 import torch
 import torch.nn as nn
@@ -213,12 +214,23 @@ class LLaMA(llama_adapter.LLaMA):
         return cls(LLaMAConfig.from_name(name))
 
 
-def mark_only_adapter_as_trainable(model: LLaMA) -> None:
-    """Sets `requires_grad=False` for all non-adapter weights."""
-    for name, param in model.named_parameters():
-        param.requires_grad = "adapter_wte" in name or "gating_factor" in name
+def is_param_trainable(name: str, config: LLaMAConfig) -> bool:
+    """
+    compares param_name with string snippets of all of the names of the trainable parameters of LLaMA V2
+    """
+    return "adapter_wte" in name \
+                                or "gating_factor" in name \
+                                or "_bias" in name \
+                                or "_scale" in name \
+                                or "lm_head" in name and config.train_lm_head
 
+
+def mark_only_adapter_as_trainable(model: LLaMA) -> None:
+    """Sets `requires_grad=False` for all non-adapter and all non weight/bias
+    weights, and on lm_head if that setting has been set."""
+    for name, param in model.named_parameters():
+        param.requires_grad = is_param_trainable(name, model.config)
 
 def adapter_state_from_state_dict(state_dict: dict) -> dict:
     """Returns the model state dict with only the adapter weights for saving."""
-    return {name: param for name, param in state_dict.items() if "adapter_wte" in name or "gating_factor" in name}
+    return {name: param for name, param in state_dict.items() if is_param_trainable(name, state_dict["config"]) }
