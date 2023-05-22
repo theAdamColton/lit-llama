@@ -40,6 +40,9 @@ class Tokenizer:
 
         return torch.tensor(tokens, dtype=torch.int, device=device)
 
+    def __call__(self, *args, **kwargs) -> torch.Tensor:
+        return self.encode(*args, **kwargs)
+
     def decode(self, tokens: torch.Tensor) -> str:
         return self.processor.decode(tokens.tolist())
 

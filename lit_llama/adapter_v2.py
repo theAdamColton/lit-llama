@@ -25,13 +25,9 @@ from lit_llama.utils import find_multiple
 class LLaMAConfig(llama_adapter.LLaMAConfig):
     add_bias_and_scale: bool = True
     adapter_prompt_length: int = 10
-    adapter_start_layer: int = 2
-    train_wte: bool = False
-    train_lm_head: bool = False
-    # The token ids of the learned pretext tokens which are to be gated with a
-    # learned gating factor are the last `pretext_adapter_length` ids of the
-    # model's vocab_size. Leave this as 0 if there are no learned pretext tokens.
-    pretext_adapter_length:int = 0
+    adapter_start_layer: int = 1
+    train_wte: bool = True
+    train_lm_head: bool = True
 
 
 def with_s_b(x, module, scale, bias):

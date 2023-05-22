@@ -2,6 +2,8 @@
 Expects training data as a json, with 
 """
 import os
+import random
+import json
 import sys
 import time
 from pathlib import Path
@@ -10,6 +12,7 @@ import shutil
 import lightning as L
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -47,15 +50,83 @@ ds_config = {
 }
 
 
+
+class MixedAlpacaConceptDataset(IterableDataset):
+    def __init__(self, concept_jsonpath: str, alpaca_jsonpath: str, tokenizer: Tokenizer, alpaca_chance=0.3):
+        # json field names prefixes
+        self.concept_prompt_types = ["retrieval_", "describe_"]
+
+        self.tokenizer = tokenizer
+        
+        self.alpaca_chance = alpaca_chance
+
+        with open(concept_jsonpath, "r") as f:
+            self.concept_d = json.load(f)
+
+        with open(alpaca_jsonpath, "r") as f:
+            self.alpaca_d = json.load(f)
+        
+        self.batch_size = batch_size
+
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        """
+        returns a random prompt, response
+        """
+        if torch.rand((1,)).item() > self.alpaca_chance:
+            i = torch.randint(len(self.concept_d), (1,)).item()
+            prompt_type = random.choice(self.concept_prompt_types)
+            x = self.concept_d[i][f"{prompt_type}prompt"]
+            y = self.concept_d[i][f"{prompt_type}response"]
+        else:
+            i = torch.randint(len(self.alpaca_d), (1,)).item()
+            x = self.alpaca_d[i]["instruction"] + " " + self.alpaca_d[i]["input"]
+            y = self.alpaca_d[i]["output"]
+        
+        x = torch.from_numpy(self.tokenizer(x))
+        y = torch.from_numpy(self.tokenizer(y))
+        
+        return x, y
+
+def collate_token_batch(batch):
+    input_ids, labels = batch
+
+    max_len = max(len(s) for s in input_ids)
+
+    def pad_right(x, pad_id):
+        # pad right based on the longest sequence
+        n = max_len - len(x)
+        return torch.cat((x, torch.full((n,), pad_id, dtype=x.dtype)))
+
+    x = torch.stack([pad_right(x, pad_id=0) for x in input_ids])
+    y = torch.stack([pad_right(x, pad_id=-1) for x in labels])
+    return x, y
+
+def get_dataloader(concept_dataset: MixedAlpacaConceptDataset, fabric: L.Fabric, **kwargs):
+    dl= DataLoader(concept_dataset, collate_fn=collate_token_batch, **kwargs)
+    return fabric.setup_dataloaders(dl)
+
+
+def load_datasets(path, tokenizer):
+    train_ds = MixedAlpacaConceptDataset(path + "/train/concepts.json", path + "/train/alpaca_data_cleaned", tokenizer)
+    test_ds = MixedAlpacaConceptDataset(path + "/test/concepts.json", path + "/test/alpaca_data_cleaned", tokenizer)
+    return train_ds, test_ds
+
+
 def main(
-    data_json: str = "data/alpaca_v2.json", 
+    # Should contain 2 json files, train and test
+    data_dir: str = "data/llama_adapter_v2_custom/", 
     pretrained_path: str = "checkpoints/lit-llama/7B/lit-llama.pth",
     tokenizer_path: str = "checkpoints/lit-llama/tokenizer-modified.model",
     out_dir: str = "out/adapter/alpaca",
 ):
+    tokenizer = Tokenizer(tokenizer_path)
 
     fabric = L.Fabric(
-        accelerator="cuda", 
+        accelerator="cpu", 
         devices=devices, 
         strategy=(DeepSpeedStrategy(config=ds_config) if devices > 1 else "auto"), 
         precision="bf16-true",
@@ -66,7 +137,8 @@ def main(
     if fabric.global_rank == 0:
         os.makedirs(out_dir, exist_ok=True)
 
-    train_data, val_data = load_datasets(data_dir=data_dir)
+    train_ds, val_ds = load_datasets(data_dir, tokenizer)
+    train_dl, val_dl = get_dataloader(train_ds, fabric, batch_size=batch_size), get_dataloader(val_ds, fabric, batch_size=batch_size)
 
     config = LLaMAConfig(block_size=max_seq_length)
 
@@ -79,17 +151,22 @@ def main(
 
     with fabric.init_module():
         model = LLaMA(config)
-        # strict=False because missing keys due to adapter weights not containted in state dict
+        # strict=False because missing keys due to adapter weights and bias/scale not containted in state dict
         model.load_state_dict(checkpoint, strict=False)
 
     mark_only_adapter_as_trainable(model)
 
+
     num_params = sum([p.numel() for p in model.parameters() if p.requires_grad])
     print(f"Number of trainable parameters: {num_params}")
 
+    # TODO check _bias , _scale in params
+    import bpdb
+    bpdb.set_trace()
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     model, optimizer = fabric.setup(model, optimizer)
-    train(fabric, model, optimizer, train_data, val_data, out_dir, tokenizer_path)
+    train(fabric, model, optimizer, train_dl, val_dl, out_dir, tokenizer)
 
     # Save the final checkpoint at the end of training
     save_model_checkpoint(fabric, model, os.path.join(out_dir, "lit-llama-adapter-finetuned.pth"))
@@ -99,10 +176,10 @@ def train(
     fabric: L.Fabric,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    train_data: np.ndarray,
-    val_data: np.ndarray,
+    train_dl: DataLoader,
+    val_dl: DataLoader,
     out_dir: str,
-    tokenizer_path: str,
+    tokenizer: Tokenizer,
 ) -> None:
     """The training loop.
 
@@ -120,7 +197,7 @@ def train(
 
         t0 = time.time()
 
-        input_ids, targets = get_batch(fabric, train_data)
+        input_ids, targets = next(iter(train_dl))
         logits = model(input_ids)
         loss = loss_fn(logits, targets)
         with fabric.no_backward_sync(model, enabled=((iter_num + 1) % gradient_accumulation_steps != 0)):
@@ -132,7 +209,7 @@ def train(
             step_count += 1
                 
             if step_count % eval_interval == 0:
-                val_loss = validate(fabric, model, val_data, tokenizer_path)
+                val_loss = validate(fabric, model, val_dl.dataset, tokenizer)
                 fabric.print(f"step {iter_num}: val loss {val_loss:.4f}")
                 fabric.barrier()
 
@@ -146,8 +223,7 @@ def train(
             fabric.print(f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms")
 
 
-def generate_response(model, instruction, tokenizer_path, input=""):
-    tokenizer = Tokenizer()
+def generate_response(model, instruction, tokenizer, input=""):
     sample = {"instruction": instruction, "input": input}
     prompt = generate_prompt(sample)
     encoded = tokenizer.encode(prompt, bos=True, eos=False, device=model.device)
@@ -164,12 +240,12 @@ def generate_response(model, instruction, tokenizer_path, input=""):
 
 
 @torch.no_grad()
-def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray, tokenizer_path:str) -> torch.Tensor:
+def validate(fabric: L.Fabric, model: torch.nn.Module, val_ds: MixedAlpacaConceptDataset, tokenizer:Tokenizer) -> torch.Tensor:
     fabric.print("Validating ...")
     model.eval()
     losses = torch.zeros(eval_iters)
     for k in range(eval_iters):
-        input_ids, targets = get_batch(fabric, val_data)
+        input_ids, targets = next(val_ds)
         logits = model(input_ids)
         loss = loss_fn(logits, targets)
         losses[k] = loss.item()
@@ -177,7 +253,7 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: np.ndarray, tok
 
     # produce an example:
     instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
-    output = generate_response(model, instruction, tokenizer_path)
+    output = generate_response(model, instruction, tokenizer)
     fabric.print(instruction)
     fabric.print(output)
 
@@ -191,32 +267,6 @@ def loss_fn(logits, targets):
     loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
     return loss
     
-
-def get_batch(fabric: L.Fabric, data: list):
-    ix = torch.randint(len(data), (micro_batch_size,))
-
-    input_ids = [data[i]["input_ids"].type(torch.int64) for i in ix]
-    labels = [data[i]["labels"].type(torch.int64) for i in ix]
-
-    max_len = max(len(s) for s in input_ids)
-
-    def pad_right(x, pad_id):
-        # pad right based on the longest sequence
-        n = max_len - len(x)
-        return torch.cat((x, torch.full((n,), pad_id, dtype=x.dtype)))
-
-    x = torch.stack([pad_right(x, pad_id=0) for x in input_ids])
-    y = torch.stack([pad_right(x, pad_id=-1) for x in labels])
-    x, y = fabric.to_device((x.pin_memory(), y.pin_memory()))
-    return x, y
-
-
-def load_datasets(data_dir):
-    train_data = torch.load(os.path.join(data_dir, "train.pt"))
-    val_data = torch.load(os.path.join(data_dir, "test.pt"))
-    return train_data, val_data
-
-
 def save_model_checkpoint(fabric, model, file_path):
     file_path = Path(file_path)
 
