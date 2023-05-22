@@ -17,6 +17,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import lit_llama.adapter as llama_adapter
 from lit_llama.model import build_rope_cache, apply_rope, RMSNorm, MLP
+from lit_llama.utils import find_multiple
 
 
 @dataclass
@@ -62,6 +63,11 @@ class CausalSelfAttention(nn.Module):
             self.c_attn_scale = nn.Parameter(torch.ones(3 * config.n_embd))
             self.c_proj_bias = nn.Parameter(torch.zeros(config.n_embd))
             self.c_proj_scale = nn.Parameter(torch.ones(config.n_embd))
+        else:
+            self.c_attn_bias = None
+            self.c_attn_scale = None
+            self.c_proj_bias = None
+            self.c_proj_scale = None
 
         
         if block_idx >= config.adapter_start_layer:
@@ -133,6 +139,38 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+class MLP(nn.Module):
+    def __init__(self, config: LLaMAConfig) -> None:
+        super().__init__()
+        hidden_dim = 4 * config.n_embd
+        n_hidden = int(2 * hidden_dim / 3)
+        n_hidden = find_multiple(n_hidden, 256)
+
+        self.c_fc1 = nn.Linear(config.n_embd, n_hidden, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, n_hidden, bias=False)
+        self.c_proj = nn.Linear(n_hidden, config.n_embd, bias=False)
+
+        if config.add_bias_and_scale:
+            self.c_fc1_bias = nn.Parameter(torch.zeros(config.n_embd))
+            self.c_fc2_bias = nn.Parameter(torch.zeros(config.n_embd))
+            self.c_proj_bias = nn.Parameter(torch.zeros(n_hidden))
+            self.c_fc1_scale = nn.Parameter(torch.ones(n_hidden))
+            self.c_fc2_scale = nn.Parameter(torch.ones(n_hidden))
+            self.c_proj_scale = nn.Parameter(torch.ones(config.n_embd))
+        else:
+            self.c_fc1_bias = None
+            self.c_fc2_bias = None
+            self.c_proj_bias =None
+            self.c_fc1_scale =None
+            self.c_fc2_scale =None
+            self.c_proj_scale =None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.silu(with_s_b(x, self.c_fc1, self.c_fc1_scale, self.c_fc1_bias)) * with_s_b(x, self.c_fc2, self.c_fc2_scale, self.c_fc2_bias)
+        x = with_s_b(x, self.c_proj, self.c_proj_scale, self.c_proj_bias)
+        return x
+
+
 class Block(nn.Module):
     """The implementation is identical to `lit_llama.model.Block` with the exception that
     we replace the attention layer where adaption is implemented."""
@@ -161,6 +199,7 @@ class LLaMA(llama_adapter.LLaMA):
         self.config = config
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
