@@ -222,10 +222,12 @@ def is_param_trainable(name: str, config: LLaMAConfig) -> bool:
     compares param_name with string snippets of all of the names of the trainable parameters of LLaMA V2
     """
     return "adapter_wte" in name \
-                                or "gating_factor" in name \
-                                or "_bias" in name \
-                                or "_scale" in name \
-                                or "lm_head" in name and config.train_lm_head
+        or "gating_factor" in name \
+        or "_bias" in name \
+        or "_scale" in name\
+        or ("lm_head" in name and config.train_lm_head) \
+        or ("wte" in name and config.train_wte)
+
 
 
 def mark_only_adapter_as_trainable(model: LLaMA) -> None:

@@ -26,14 +26,14 @@ from lightning.fabric.strategies import DeepSpeedStrategy
 
 
 eval_interval = 600
-save_interval = 1000
+save_interval = 100
 eval_iters = 100
 log_interval = 1
 devices = 1
 
 # Hyperparameters
 learning_rate = 9e-3
-batch_size = 64 / devices
+batch_size = 64 // devices
 micro_batch_size = 4
 gradient_accumulation_steps = batch_size // micro_batch_size
 epoch_size = 50000  # train dataset size
@@ -50,9 +50,12 @@ ds_config = {
 }
 
 
-
 class MixedAlpacaConceptDataset(IterableDataset):
-    def __init__(self, concept_jsonpath: str, alpaca_jsonpath: str, tokenizer: Tokenizer, alpaca_chance=0.3):
+    """
+    Gives batches of mixed instruction-following, image_retrieval, and
+    image_description tasks
+    """
+    def __init__(self, concept_jsonpath: str, alpaca_pt_path: str, tokenizer: Tokenizer, alpaca_chance=0.3):
         # json field names prefixes
         self.concept_prompt_types = ["retrieval_", "describe_"]
 
@@ -63,8 +66,7 @@ class MixedAlpacaConceptDataset(IterableDataset):
         with open(concept_jsonpath, "r") as f:
             self.concept_d = json.load(f)
 
-        with open(alpaca_jsonpath, "r") as f:
-            self.alpaca_d = json.load(f)
+        self.alpaca_d = torch.load(alpaca_pt_path)
         
         self.batch_size = batch_size
 
@@ -76,23 +78,20 @@ class MixedAlpacaConceptDataset(IterableDataset):
         """
         returns a random prompt, response
         """
-        if torch.rand((1,)).item() > self.alpaca_chance:
+        if torch.rand((1,)).item() >= self.alpaca_chance:
             i = torch.randint(len(self.concept_d), (1,)).item()
             prompt_type = random.choice(self.concept_prompt_types)
-            x = self.concept_d[i][f"{prompt_type}prompt"]
-            y = self.concept_d[i][f"{prompt_type}response"]
+            x = torch.LongTensor(self.concept_d[i][f"{prompt_type}input_ids"]).to(torch.int32)
+            y = torch.LongTensor(self.concept_d[i][f"{prompt_type}labels"]).to(torch.int32)
         else:
             i = torch.randint(len(self.alpaca_d), (1,)).item()
-            x = self.alpaca_d[i]["instruction"] + " " + self.alpaca_d[i]["input"]
-            y = self.alpaca_d[i]["output"]
-        
-        x = torch.from_numpy(self.tokenizer(x))
-        y = torch.from_numpy(self.tokenizer(y))
+            x = self.alpaca_d[i]["input_ids"]
+            y = self.alpaca_d[i]["labels"]
         
         return x, y
 
 def collate_token_batch(batch):
-    input_ids, labels = batch
+    input_ids, labels = zip(*batch)
 
     max_len = max(len(s) for s in input_ids)
 
@@ -111,14 +110,14 @@ def get_dataloader(concept_dataset: MixedAlpacaConceptDataset, fabric: L.Fabric,
 
 
 def load_datasets(path, tokenizer):
-    train_ds = MixedAlpacaConceptDataset(path + "/train/concepts.json", path + "/train/alpaca_data_cleaned", tokenizer)
-    test_ds = MixedAlpacaConceptDataset(path + "/test/concepts.json", path + "/test/alpaca_data_cleaned", tokenizer)
+    train_ds = MixedAlpacaConceptDataset(path + "/llama_adapter_v2_custom/concepts_tokenized.json", path + "alpaca/train.pt", tokenizer)
+    test_ds = MixedAlpacaConceptDataset(path + "/llama_adapter_v2_custom/concepts_tokenized_test.json", path + "alpaca/test.pt", tokenizer)
     return train_ds, test_ds
 
 
 def main(
     # Should contain 2 json files, train and test
-    data_dir: str = "data/llama_adapter_v2_custom/", 
+    data_dir: str = "data/", 
     pretrained_path: str = "checkpoints/lit-llama/7B/lit-llama.pth",
     tokenizer_path: str = "checkpoints/lit-llama/tokenizer-modified.model",
     out_dir: str = "out/adapter/alpaca",
@@ -126,9 +125,8 @@ def main(
     tokenizer = Tokenizer(tokenizer_path)
 
     fabric = L.Fabric(
-        accelerator="cpu", 
-        devices=devices, 
-        strategy=(DeepSpeedStrategy(config=ds_config) if devices > 1 else "auto"), 
+        accelerator="cuda", 
+        devices=1, 
         precision="bf16-true",
     )
     fabric.launch()
@@ -138,7 +136,7 @@ def main(
         os.makedirs(out_dir, exist_ok=True)
 
     train_ds, val_ds = load_datasets(data_dir, tokenizer)
-    train_dl, val_dl = get_dataloader(train_ds, fabric, batch_size=batch_size), get_dataloader(val_ds, fabric, batch_size=batch_size)
+    train_dl, val_dl = get_dataloader(train_ds, fabric, batch_size=micro_batch_size), get_dataloader(val_ds, fabric, batch_size=micro_batch_size)
 
     config = LLaMAConfig(block_size=max_seq_length)
 
@@ -158,18 +156,18 @@ def main(
 
 
     num_params = sum([p.numel() for p in model.parameters() if p.requires_grad])
-    print(f"Number of trainable parameters: {num_params}")
-
-    # TODO check _bias , _scale in params
-    import bpdb
-    bpdb.set_trace()
+    num_wte_params = sum([p.numel() for n, p in model.named_parameters() if p.requires_grad and "wte" in n])
+    num_b_s_params = sum([p.numel() for n, p in model.named_parameters() if p.requires_grad and ("_bias" in n or "_scale" in n)])
+    total_params = sum([p.numel() for p in model.parameters()])
+    print(f"{num_params / 1000000:.4f}M trainable {total_params / 1000000:.4f}M total")
+    print(f"{num_wte_params / 1000000:.4f}M wte {num_b_s_params / 1000000:.4f}M scale/bias")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     model, optimizer = fabric.setup(model, optimizer)
     train(fabric, model, optimizer, train_dl, val_dl, out_dir, tokenizer)
 
     # Save the final checkpoint at the end of training
-    save_model_checkpoint(fabric, model, os.path.join(out_dir, "lit-llama-adapter-finetuned.pth"))
+    save_model_checkpoint(fabric, model, os.path.join(out_dir, "lit-llama-adapterv2-finetuned.pth"))
 
 
 def train(
@@ -198,6 +196,7 @@ def train(
         t0 = time.time()
 
         input_ids, targets = next(iter(train_dl))
+
         logits = model(input_ids)
         loss = loss_fn(logits, targets)
         with fabric.no_backward_sync(model, enabled=((iter_num + 1) % gradient_accumulation_steps != 0)):
@@ -252,7 +251,8 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_ds: MixedAlpacaConcep
     val_loss = losses.mean()
 
     # produce an example:
-    instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
+    # V0.0 prompt:
+    instruction = "What is in this picture?<SOC><CID=2><CID=1><CID=7><CID=3><CID=7><CID=5><EOC>"
     output = generate_response(model, instruction, tokenizer)
     fabric.print(instruction)
     fabric.print(output)
