@@ -30,7 +30,7 @@ class LLaMAConfig(llama_adapter.LLaMAConfig):
     train_lm_head: bool = True
 
 
-def with_s_b(x, module, scale, bias):
+def with_s_b(x, module, scale: nn.Embedding, bias: nn.Embedding):
     """
     Forward with scale and bias
 
@@ -38,7 +38,7 @@ def with_s_b(x, module, scale, bias):
     different from this in their implementation.
     """
     if scale is not None and bias is not None:
-        return scale(module(x + bias) )
+        return scale * (module(x + bias) )
     else:
         return module(x)
 
@@ -236,6 +236,6 @@ def mark_only_adapter_as_trainable(model: LLaMA) -> None:
     for name, param in model.named_parameters():
         param.requires_grad = is_param_trainable(name, model.config)
 
-def adapter_state_from_state_dict(state_dict: dict) -> dict:
+def adapter_state_from_state_dict(state_dict: dict, config: LLaMAConfig) -> dict:
     """Returns the model state dict with only the adapter weights for saving."""
-    return {name: param for name, param in state_dict.items() if is_param_trainable(name, state_dict["config"]) }
+    return {name: param for name, param in state_dict.items() if is_param_trainable(name, config) }

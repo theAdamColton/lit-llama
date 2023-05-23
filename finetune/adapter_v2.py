@@ -25,9 +25,9 @@ from scripts.prepare_alpaca import generate_prompt
 from lightning.fabric.strategies import DeepSpeedStrategy
 
 
-eval_interval = 600
-save_interval = 100
-eval_iters = 100
+eval_interval = 100
+save_interval = 50
+eval_iters = 20
 log_interval = 1
 devices = 1
 
@@ -41,7 +41,7 @@ num_epochs = 5
 max_iters = num_epochs * epoch_size // devices
 weight_decay = 0.02
 max_seq_length = 256  # see scripts/prepare_alpaca.py
-warmup_steps = epoch_size * 2 // micro_batch_size // devices  # 2 epochs
+warmup_steps = epoch_size * 2 // micro_batch_size // devices
 
 ds_config = {
     "train_micro_batch_size_per_gpu": micro_batch_size,
@@ -81,12 +81,16 @@ class MixedAlpacaConceptDataset(IterableDataset):
         if torch.rand((1,)).item() >= self.alpaca_chance:
             i = torch.randint(len(self.concept_d), (1,)).item()
             prompt_type = random.choice(self.concept_prompt_types)
-            x = torch.LongTensor(self.concept_d[i][f"{prompt_type}input_ids"]).to(torch.int32)
-            y = torch.LongTensor(self.concept_d[i][f"{prompt_type}labels"]).to(torch.int32)
+            x = torch.LongTensor(self.concept_d[i][f"{prompt_type}input_ids"])
+            y = torch.LongTensor(self.concept_d[i][f"{prompt_type}labels"])
         else:
             i = torch.randint(len(self.alpaca_d), (1,)).item()
-            x = self.alpaca_d[i]["input_ids"]
-            y = self.alpaca_d[i]["labels"]
+            x = self.alpaca_d[i]["input_ids"].to(torch.int64)
+            y = self.alpaca_d[i]["labels"].to(torch.int64)
+
+        block_size = 256
+        x = x[:block_size]
+        y = y[:block_size]
         
         return x, y
 
@@ -167,7 +171,7 @@ def main(
     train(fabric, model, optimizer, train_dl, val_dl, out_dir, tokenizer)
 
     # Save the final checkpoint at the end of training
-    save_model_checkpoint(fabric, model, os.path.join(out_dir, "lit-llama-adapterv2-finetuned.pth"))
+    save_model_checkpoint(fabric, model, os.path.join(out_dir, "lit-llama-adapterv2-finetuned.pth"), config)
 
 
 def train(
@@ -208,14 +212,14 @@ def train(
             step_count += 1
                 
             if step_count % eval_interval == 0:
-                val_loss = validate(fabric, model, val_dl.dataset, tokenizer)
+                val_loss = validate(fabric, model, val_dl, tokenizer)
                 fabric.print(f"step {iter_num}: val loss {val_loss:.4f}")
                 fabric.barrier()
 
             if step_count % save_interval == 0:
                 print(f"Saving adapter weights to {out_dir}")
                 # TODO: Provide a function/script to merge the adapter weights with pretrained weights
-                save_model_checkpoint(fabric, model, os.path.join(out_dir, f"iter-{iter_num:06d}.pth"))
+                save_model_checkpoint(fabric, model, os.path.join(out_dir, f"iter-{iter_num:06d}.pth"), model.config)
 
         dt = time.time() - t0
         if iter_num % log_interval == 0:
@@ -239,12 +243,12 @@ def generate_response(model, instruction, tokenizer, input=""):
 
 
 @torch.no_grad()
-def validate(fabric: L.Fabric, model: torch.nn.Module, val_ds: MixedAlpacaConceptDataset, tokenizer:Tokenizer) -> torch.Tensor:
+def validate(fabric: L.Fabric, model: torch.nn.Module, val_dl, tokenizer:Tokenizer) -> torch.Tensor:
     fabric.print("Validating ...")
     model.eval()
     losses = torch.zeros(eval_iters)
     for k in range(eval_iters):
-        input_ids, targets = next(val_ds)
+        input_ids, targets = next(iter(val_dl))
         logits = model(input_ids)
         loss = loss_fn(logits, targets)
         losses[k] = loss.item()
@@ -252,7 +256,7 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_ds: MixedAlpacaConcep
 
     # produce an example:
     # V0.0 prompt:
-    instruction = "What is in this picture?<SOC><CID=2><CID=1><CID=7><CID=3><CID=7><CID=5><EOC>"
+    instruction = "What is the meaning of life?"
     output = generate_response(model, instruction, tokenizer)
     fabric.print(instruction)
     fabric.print(output)
@@ -267,7 +271,7 @@ def loss_fn(logits, targets):
     loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
     return loss
     
-def save_model_checkpoint(fabric, model, file_path):
+def save_model_checkpoint(fabric, model, file_path, config):
     file_path = Path(file_path)
 
     if isinstance(fabric.strategy, DeepSpeedStrategy):
@@ -280,11 +284,11 @@ def save_model_checkpoint(fabric, model, file_path):
             # Create a consolidated checkpoint with the same name next to the deepspeed checkpoint
             # and only keep the adapter weights
             state_dict = get_fp32_state_dict_from_zero_checkpoint(tmp_path)
-            state_dict = adapter_state_from_state_dict(state_dict)
+            state_dict = adapter_state_from_state_dict(state_dict, config)
             torch.save(state_dict, file_path)
             shutil.rmtree(tmp_path)
     else:
-        state_dict = adapter_state_from_state_dict(model.state_dict())
+        state_dict = adapter_state_from_state_dict(model.state_dict(), config)
         if fabric.global_rank == 0:
             torch.save(state_dict, file_path)
         fabric.barrier()
